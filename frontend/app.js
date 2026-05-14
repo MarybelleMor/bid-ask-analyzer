@@ -231,6 +231,9 @@ function applySampleToSeries(sample) {
   for (const entry of state.series.values()) {
     const value = lookupIndicator(sample, entry.indicatorKey);
     if (value === null || value === undefined || Number.isNaN(value)) continue;
+    // One value per bucket: snapshot at bucket open. The indicator line
+    // therefore steps at TF boundaries instead of jiggling every second.
+    if (entry.buckets.has(bucket)) continue;
     entry.buckets.set(bucket, value);
     try { entry.series.update({ time: bucket, value }); } catch (e) { /* ignore */ }
   }
@@ -247,7 +250,9 @@ function seedSeriesFromCache() {
       if (v === null || v === undefined || Number.isNaN(v)) continue;
       let m = bucketsByKey.get(entry);
       if (!m) { m = new Map(); bucketsByKey.set(entry, m); }
-      m.set(bucket, v);
+      // Keep the FIRST value seen per bucket so each bucket reflects its
+      // opening snapshot, matching the live-update semantics above.
+      if (!m.has(bucket)) m.set(bucket, v);
     }
   }
   for (const entry of state.series.values()) {
