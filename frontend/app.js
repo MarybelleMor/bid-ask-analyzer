@@ -166,17 +166,14 @@ function layoutPanes() {
   if (!state.chart) return;
   const panes = state.chart.panes();
   if (panes.length === 0) return;
-  const total = els.chart.clientHeight - 28;
-  if (total <= 0) return;
-  const indicatorPanes = Math.max(0, panes.length - 2);
-  const candleH = Math.max(240, Math.floor(total * (indicatorPanes > 0 ? 0.5 : 0.85)));
-  const volumeH = Math.max(80, Math.floor(total * 0.12));
-  const remaining = Math.max(0, total - candleH - volumeH);
-  const perPane = indicatorPanes > 0 ? Math.max(80, Math.floor(remaining / indicatorPanes)) : 0;
-  try { panes[0].setHeight(candleH); } catch (e) { /* ignore */ }
-  if (panes[1]) { try { panes[1].setHeight(volumeH); } catch (e) { /* ignore */ } }
-  for (let i = 2; i < panes.length; i += 1) {
-    try { panes[i].setHeight(perPane); } catch (e) { /* ignore */ }
+  // lightweight-charts v5 distributes pane height by `stretchFactor`.
+  // We want the candle pane dominant, volume small, and indicator panes
+  // (each) somewhat smaller than candles.
+  const factors = [5];          // candles
+  if (panes.length > 1) factors.push(1); // volume
+  for (let i = 2; i < panes.length; i += 1) factors.push(2);
+  for (let i = 0; i < panes.length; i += 1) {
+    try { panes[i].setStretchFactor(factors[i]); } catch (e) { /* ignore */ }
   }
 }
 
@@ -570,6 +567,12 @@ async function loadDataForSymbol() {
   } catch (e) {
     console.error(e);
   }
+  // Lightweight-charts may resize panes on the first setData, so re-apply our
+  // layout after data is loaded.
+  requestAnimationFrame(() => {
+    layoutPanes();
+    requestAnimationFrame(layoutPanes);
+  });
 }
 
 async function boot() {
