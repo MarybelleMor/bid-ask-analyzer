@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BID/ASK Analyzer</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-left">
+      <strong>BID/ASK Analyzer</strong>
+      <select id="symbol-select" class="control"></select>
+      <div class="interval-buttons" id="interval-buttons">
+        <button data-interval="1m">1м</button>
+        <button data-interval="5m">5м</button>
+        <button data-interval="15m" class="active">15м</button>
+        <button data-interval="1h">1ч</button>
+        <button data-interval="4h">4ч</button>
+        <button data-interval="1d">1д</button>
+      </div>
+      <span class="badge" id="price-badge">—</span>
+    </div>
+    <div class="topbar-right">
+      <span id="status" class="status">connecting…</span>
+      <button id="add-pane" class="control">+ панель</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <div id="chart" class="chart"></div>
+    <aside id="sidebar" class="sidebar">
+      <h3>Индикаторы по панелям</h3>
+      <div id="pane-list" class="pane-list"></div>
+      <div class="hint">
+        Левый клик по индикатору добавляет его в выбранную панель,
+        правый — убирает.
+        Источник данных — публичный спот-стакан Binance, 5000 уровней.
+      </div>
+      <div class="hint">
+        <a href="https://github.com/" target="_blank" rel="noopener">README</a>
+        описывает все вычисления.
+      </div>
+    </aside>
+  </main>
+
+  <script type="importmap">
+    {
+      "imports": {
+        "lightweight-charts": "https://cdn.jsdelivr.net/npm/lightweight-charts@5.0.7/dist/lightweight-charts.standalone.production.mjs"
+      }
+    }
+  </script>
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>
