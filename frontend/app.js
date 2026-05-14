@@ -271,21 +271,26 @@ function pushSampleCache(sample) {
 // Data sources
 // ---------------------------------------------------------------------------
 
+// Use `location.origin` (host without userinfo) as the API base. This matters
+// when the page is served via a tunnel like https://user:pass@.../ — fetch
+// throws if the request URL inherits credentials from the base URL.
+const API_BASE = location.origin;
+
 async function fetchConfig() {
-  const res = await fetch("/api/config");
+  const res = await fetch(`${API_BASE}/api/config`);
   if (!res.ok) throw new Error(`config failed: ${res.status}`);
   return res.json();
 }
 
 async function fetchKlines() {
-  const url = `/api/symbols/${state.symbol}/klines?interval=${state.interval}&limit=500`;
+  const url = `${API_BASE}/api/symbols/${state.symbol}/klines?interval=${state.interval}&limit=500`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`klines failed: ${res.status}`);
   return res.json();
 }
 
 async function fetchHistory() {
-  const url = `/api/symbols/${state.symbol}/history`;
+  const url = `${API_BASE}/api/symbols/${state.symbol}/history`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`history failed: ${res.status}`);
   return res.json();
@@ -339,6 +344,8 @@ function connectWs() {
   if (state.ws) {
     try { state.ws.close(); } catch (e) { /* ignore */ }
   }
+  // location.host strips credentials, important when the page is served via
+  // a basic-auth tunnel (otherwise WebSocket also rejects the URL).
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
   const url = `${proto}//${location.host}/ws/${state.symbol}`;
   const ws = new WebSocket(url);
