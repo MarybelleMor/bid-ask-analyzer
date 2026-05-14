@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import AsyncIterator
+import os
 from typing import Any
 
 import httpx
@@ -30,6 +30,13 @@ log = logging.getLogger(__name__)
 REST_BASE = "https://data-api.binance.vision"
 WS_BASE = "wss://data-stream.binance.vision"
 DEPTH_LIMIT = 5000
+# How often to re-fetch the REST snapshot and merge any newly visible price
+# levels back into the live book. Public /api/v3/depth?limit=5000 only returns
+# the 5000 best price levels at the moment of the call; levels that sit deeper
+# in the book and never change are invisible through the diff stream. By
+# repeatedly snapshotting we gradually accumulate those previously hidden
+# levels, which gives a deeper aggregated picture for the wider P windows.
+RESNAPSHOT_INTERVAL_SEC = float(os.environ.get("RESNAPSHOT_INTERVAL_SEC", "60"))
 
 
 class OrderBook:
@@ -118,6 +125,10 @@ class OrderBookMaintainer:
         self.symbol = symbol.upper()
         self.book = OrderBook()
         self._reconnects = 0
+        # While a periodic re-snapshot fetch is in flight we record every
+        # price touched by an incoming diff so the merge step doesn't put
+        # stale snapshot data over a level we already updated.
+        self._touched: tuple[set[float], set[float]] | None = None
 
     async def run(self) -> None:
         """Run forever, reconnecting on any error."""
@@ -141,11 +152,27 @@ class OrderBookMaintainer:
             ping_timeout=20,
             max_size=2**22,
         ) as ws:
-            async for event in self._consume(ws):
-                self._handle_event(event)
+            ok = await self._initial_sync(ws)
+            if not ok:
+                return
+            periodic = asyncio.create_task(self._periodic_resnapshot_loop())
+            try:
+                while True:
+                    msg = await ws.recv()
+                    event = json.loads(msg)
+                    self._handle_event(event)
+            finally:
+                periodic.cancel()
+                try:
+                    await periodic
+                except (asyncio.CancelledError, Exception):
+                    pass
 
-    async def _consume(self, ws: websockets.WebSocketClientProtocol) -> AsyncIterator[dict[str, Any]]:
-        # Buffer diff events that arrive before snapshot.
+    async def _initial_sync(self, ws: websockets.WebSocketClientProtocol) -> bool:
+        """Replicate Binance's initial sync handshake.
+
+        Returns True on success, False to trigger a reconnect via the outer loop.
+        """
         buffered: list[dict[str, Any]] = []
         snapshot_task = asyncio.create_task(self._fetch_snapshot())
         try:
@@ -155,42 +182,96 @@ class OrderBookMaintainer:
                 if not snapshot_task.done():
                     buffered.append(event)
                     continue
-                if not self.book.ready:
-                    snapshot = snapshot_task.result()
-                    self.book.apply_snapshot(snapshot)
-                    log.info(
-                        "[%s] snapshot applied, lastUpdateId=%d, %d bids / %d asks",
-                        self.symbol,
-                        self.book.last_update_id,
-                        len(self.book.bids),
-                        len(self.book.asks),
-                    )
-                    buffered.append(event)
-                    started = False
-                    for buffered_event in buffered:
-                        u = int(buffered_event["u"])
-                        big_u = int(buffered_event["U"])
-                        if u <= self.book.last_update_id:
-                            continue
-                        if not started:
-                            if not (big_u <= self.book.last_update_id + 1 <= u):
-                                log.warning(
-                                    "[%s] first event mismatch (U=%d, lastUpdateId+1=%d, u=%d); resyncing",
-                                    self.symbol,
-                                    big_u,
-                                    self.book.last_update_id + 1,
-                                    u,
-                                )
-                                self.book.ready = False
-                                return
-                            started = True
-                        yield buffered_event
-                        self.book.last_update_id = u
-                    buffered.clear()
-                else:
-                    yield event
+                snapshot = snapshot_task.result()
+                self.book.apply_snapshot(snapshot)
+                log.info(
+                    "[%s] snapshot applied, lastUpdateId=%d, %d bids / %d asks",
+                    self.symbol,
+                    self.book.last_update_id,
+                    len(self.book.bids),
+                    len(self.book.asks),
+                )
+                buffered.append(event)
+                started = False
+                for buffered_event in buffered:
+                    u = int(buffered_event["u"])
+                    big_u = int(buffered_event["U"])
+                    if u <= self.book.last_update_id:
+                        continue
+                    if not started:
+                        if not (big_u <= self.book.last_update_id + 1 <= u):
+                            log.warning(
+                                "[%s] first event mismatch (U=%d, lastUpdateId+1=%d, u=%d); resyncing",
+                                self.symbol,
+                                big_u,
+                                self.book.last_update_id + 1,
+                                u,
+                            )
+                            self.book.ready = False
+                            return False
+                        started = True
+                    self.book.apply_diff(buffered_event["b"], buffered_event["a"])
+                    self.book.last_update_id = u
+                return True
         finally:
-            snapshot_task.cancel()
+            if not snapshot_task.done():
+                snapshot_task.cancel()
+
+    async def _periodic_resnapshot_loop(self) -> None:
+        """Periodically pull a fresh REST snapshot and merge in unseen levels.
+
+        The diff stream from ``@depth@100ms`` only ever carries level updates,
+        so price levels that were below the initial top-5000 (and never moved)
+        stay invisible forever. Replaying ``/api/v3/depth?limit=5000`` every
+        minute lets us pick them up gradually whenever they enter the top-5000.
+        """
+        while True:
+            await asyncio.sleep(RESNAPSHOT_INTERVAL_SEC)
+            if not self.book.ready:
+                continue
+            try:
+                self._touched = (set(), set())
+                try:
+                    snapshot = await self._fetch_snapshot()
+                except Exception:
+                    log.warning("[%s] periodic snapshot fetch failed", self.symbol, exc_info=True)
+                    continue
+                touched_bids, touched_asks = self._touched
+            finally:
+                self._touched = None
+            added_b = 0
+            for px, qty in snapshot.get("bids", []):
+                px_f = float(px)
+                qty_f = float(qty)
+                if qty_f <= 0:
+                    continue
+                if px_f in touched_bids:
+                    continue
+                if -px_f in self.book.bids:
+                    continue
+                self.book.bids[-px_f] = qty_f
+                added_b += 1
+            added_a = 0
+            for px, qty in snapshot.get("asks", []):
+                px_f = float(px)
+                qty_f = float(qty)
+                if qty_f <= 0:
+                    continue
+                if px_f in touched_asks:
+                    continue
+                if px_f in self.book.asks:
+                    continue
+                self.book.asks[px_f] = qty_f
+                added_a += 1
+            if added_b or added_a:
+                log.info(
+                    "[%s] periodic merge: +%d bids, +%d asks (total %d/%d)",
+                    self.symbol,
+                    added_b,
+                    added_a,
+                    len(self.book.bids),
+                    len(self.book.asks),
+                )
 
     async def _fetch_snapshot(self) -> dict[str, Any]:
         url = f"{REST_BASE}/api/v3/depth"
@@ -217,3 +298,9 @@ class OrderBookMaintainer:
             raise RuntimeError("order book gap")
         self.book.apply_diff(event["b"], event["a"])
         self.book.last_update_id = u
+        if self._touched is not None:
+            tbids, tasks = self._touched
+            for px, _ in event["b"]:
+                tbids.add(float(px))
+            for px, _ in event["a"]:
+                tasks.add(float(px))
