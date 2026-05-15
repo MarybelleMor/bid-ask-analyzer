@@ -51,24 +51,40 @@ const els = {
   addPane: document.getElementById("add-pane"),
   status: document.getElementById("status"),
   priceBadge: document.getElementById("price-badge"),
+  coinType: document.getElementById("coin-type-select"),
 };
 
 const state = {
   config: null,
   symbol: null,
   interval: "15m",
+  // 'COIN' — indicators come from the current chart symbol's own order book.
+  // 'TOTAL' (or another aggregate name) — indicators come from a cross-symbol
+  // sum exposed by the backend as a virtual feed.
+  coinType: "COIN",
   chart: null,
   candleSeries: null,
   volumeSeries: null,
-  ws: null,
+  // Chart WS: always /ws/<chartSymbol>. Drives the live price badge and the
+  // intra-bucket candle update. When coinType === 'COIN', this also drives
+  // indicator series.
+  chartWs: null,
+  // Indicator WS: only opened when coinType is an aggregate (e.g. 'TOTAL').
+  indicatorWs: null,
   klinesLast: null,
   // map seriesKey -> { series, paneIndex, buckets: Map<bucketSec, value>, indicatorKey }
   series: new Map(),
   // ordered list of user panes
   panes: [],
   activePaneId: null,
+  // Samples used to redraw indicators when buckets change (e.g. TF switch).
+  // Only the currently-selected indicator source feeds this cache.
   sampleCache: [],
 };
+
+function indicatorSourceName() {
+  return state.coinType === "COIN" ? state.symbol : state.coinType;
+}
 
 // ---------------------------------------------------------------------------
 // Persistence
@@ -88,6 +104,7 @@ function saveSettings() {
   const data = {
     symbol: state.symbol,
     interval: state.interval,
+    coinType: state.coinType,
     panes: state.panes.map((p) => ({
       id: p.id,
       name: p.name,
@@ -295,7 +312,10 @@ async function fetchKlines() {
 }
 
 async function fetchHistory() {
-  const url = `${API_BASE}/api/symbols/${state.symbol}/history`;
+  // Indicators always read from the configured coin-type source, not from
+  // the chart symbol. With coinType=COIN they happen to coincide.
+  const src = indicatorSourceName();
+  const url = `${API_BASE}/api/symbols/${src}/history`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`history failed: ${res.status}`);
   return res.json();
@@ -345,31 +365,76 @@ function updateKlineFromTick(price) {
 // WebSocket stream
 // ---------------------------------------------------------------------------
 
-function connectWs() {
-  if (state.ws) {
-    try { state.ws.close(); } catch (e) { /* ignore */ }
-  }
+function wsBaseUrl() {
   // location.host strips credentials, important when the page is served via
   // a basic-auth tunnel (otherwise WebSocket also rejects the URL).
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  const url = `${proto}//${location.host}/ws/${state.symbol}`;
+  return `${proto}//${location.host}`;
+}
+
+function closeWs(key) {
+  const ws = state[key];
+  state[key] = null;
+  if (ws) {
+    try { ws.close(); } catch (e) { /* ignore */ }
+  }
+}
+
+// The chart WebSocket always tracks the chart symbol. It drives the candle
+// tick and the live price badge. When coinType === 'COIN' it ALSO drives the
+// indicator series, because the indicator source equals the chart symbol.
+function connectChartWs() {
+  closeWs("chartWs");
+  const url = `${wsBaseUrl()}/ws/${state.symbol}`;
   const ws = new WebSocket(url);
-  state.ws = ws;
+  state.chartWs = ws;
   ws.onopen = () => setStatus("ok", "live");
   ws.onclose = () => {
     setStatus("bad", "disconnected");
-    setTimeout(() => { if (state.symbol) connectWs(); }, 1500);
+    setTimeout(() => { if (state.symbol) connectChartWs(); }, 1500);
   };
   ws.onerror = () => setStatus("bad", "ws error");
   ws.onmessage = (ev) => {
     let msg;
     try { msg = JSON.parse(ev.data); } catch (e) { return; }
     if (!msg || !msg.sample) return;
+    if (msg.sample.mid) {
+      updateKlineFromTick(msg.sample.mid);
+      els.priceBadge.textContent = formatPrice(msg.sample.mid);
+    }
+    if (state.coinType === "COIN") {
+      pushSampleCache(msg.sample);
+      applySampleToSeries(msg.sample);
+    }
+  };
+}
+
+// The indicator WebSocket only runs when coinType is an aggregate. It feeds
+// the BID/ASK/DIFF series without touching the candle/price (which still come
+// from the chart symbol).
+function connectIndicatorWs() {
+  closeWs("indicatorWs");
+  if (state.coinType === "COIN") return;
+  const url = `${wsBaseUrl()}/ws/${state.coinType}`;
+  const ws = new WebSocket(url);
+  state.indicatorWs = ws;
+  ws.onclose = () => {
+    if (state.coinType !== "COIN") {
+      setTimeout(() => connectIndicatorWs(), 1500);
+    }
+  };
+  ws.onmessage = (ev) => {
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch (e) { return; }
+    if (!msg || !msg.sample) return;
     pushSampleCache(msg.sample);
     applySampleToSeries(msg.sample);
-    updateKlineFromTick(msg.sample.mid);
-    els.priceBadge.textContent = msg.sample.mid ? formatPrice(msg.sample.mid) : "—";
   };
+}
+
+function connectWs() {
+  connectChartWs();
+  connectIndicatorWs();
 }
 
 function setStatus(klass, text) {
@@ -563,6 +628,16 @@ function populateSymbols(symbols) {
   }
 }
 
+function populateCoinTypes(types) {
+  els.coinType.innerHTML = "";
+  for (const t of types) {
+    const opt = document.createElement("option");
+    opt.value = t;
+    opt.textContent = t;
+    els.coinType.appendChild(opt);
+  }
+}
+
 async function loadDataForSymbol() {
   try {
     const rows = await fetchKlines();
@@ -590,13 +665,27 @@ async function loadDataForSymbol() {
 async function boot() {
   setStatus("", "loading config…");
   state.config = await fetchConfig();
-  populateSymbols(state.config.symbols);
+  // Prefer chart_symbols (operator-configured) for the dropdown; fall back to
+  // every feed the backend exposes.
+  const symbols =
+    Array.isArray(state.config.chart_symbols) && state.config.chart_symbols.length
+      ? state.config.chart_symbols
+      : state.config.symbols;
+  populateSymbols(symbols);
+  const coinTypes = Array.isArray(state.config.coin_types) && state.config.coin_types.length
+    ? state.config.coin_types
+    : ["COIN"];
+  populateCoinTypes(coinTypes);
   const saved = loadSettings();
   state.symbol =
-    saved && saved.symbol && state.config.symbols.includes(saved.symbol)
+    saved && saved.symbol && symbols.includes(saved.symbol)
       ? saved.symbol
-      : state.config.symbols[0];
+      : symbols[0];
   if (saved && saved.interval) state.interval = saved.interval;
+  state.coinType =
+    saved && saved.coinType && coinTypes.includes(saved.coinType)
+      ? saved.coinType
+      : "COIN";
   state.panes =
     saved && Array.isArray(saved.panes) && saved.panes.length
       ? saved.panes.map((p, i) => ({
@@ -611,6 +700,7 @@ async function boot() {
   state.activePaneId = state.panes[0]?.id || null;
 
   els.symbol.value = state.symbol;
+  els.coinType.value = state.coinType;
   for (const btn of els.intervals.querySelectorAll("button")) {
     btn.classList.toggle("active", btn.dataset.interval === state.interval);
   }
@@ -628,6 +718,16 @@ async function boot() {
 
 els.symbol.addEventListener("change", async () => {
   state.symbol = els.symbol.value;
+  state.sampleCache = [];
+  buildChart();
+  renderSidebar();
+  await loadDataForSymbol();
+  connectWs();
+  saveSettings();
+});
+
+els.coinType.addEventListener("change", async () => {
+  state.coinType = els.coinType.value;
   state.sampleCache = [];
   buildChart();
   renderSidebar();

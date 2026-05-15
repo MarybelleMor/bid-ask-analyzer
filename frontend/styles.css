@@ -74,6 +74,20 @@ body {
 .interval-buttons button:hover { background: var(--bg-elev2); }
 .interval-buttons button.active { background: #2c5fbf; color: #fff; }
 
+.coin-type-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 4px 0 8px;
+  border-left: 1px solid var(--border);
+}
+.coin-type-label {
+  color: var(--text-dim);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
 .badge {
   font-variant-numeric: tabular-nums;
   font-weight: 600;

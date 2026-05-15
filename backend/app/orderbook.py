@@ -18,6 +18,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 from typing import Any
 
 import httpx
@@ -37,6 +38,11 @@ DEPTH_LIMIT = 5000
 # repeatedly snapshotting we gradually accumulate those previously hidden
 # levels, which gives a deeper aggregated picture for the wider P windows.
 RESNAPSHOT_INTERVAL_SEC = float(os.environ.get("RESNAPSHOT_INTERVAL_SEC", "60"))
+
+# Global semaphore that ensures only one maintainer at a time hits the Binance
+# REST API for a depth snapshot. This prevents 20 concurrent feeds from
+# bursting Binance's rate limits during startup or periodic refreshes.
+_snapshot_semaphore = asyncio.Semaphore(1)
 
 
 class OrderBook:
@@ -225,6 +231,10 @@ class OrderBookMaintainer:
         stay invisible forever. Replaying ``/api/v3/depth?limit=5000`` every
         minute lets us pick them up gradually whenever they enter the top-5000.
         """
+        # Stagger the first cycle across the configured interval so that when
+        # we run a basket of dozens of feeds their REST snapshot fetches are
+        # spread out over the window instead of all hitting Binance in a burst.
+        await asyncio.sleep(random.uniform(0, RESNAPSHOT_INTERVAL_SEC))
         while True:
             await asyncio.sleep(RESNAPSHOT_INTERVAL_SEC)
             if not self.book.ready:
@@ -276,10 +286,22 @@ class OrderBookMaintainer:
     async def _fetch_snapshot(self) -> dict[str, Any]:
         url = f"{REST_BASE}/api/v3/depth"
         params = {"symbol": self.symbol, "limit": DEPTH_LIMIT}
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            response = await client.get(url, params=params)
-            response.raise_for_status()
-            return response.json()
+        async with _snapshot_semaphore:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                for attempt in range(5):
+                    response = await client.get(url, params=params)
+                    if response.status_code in (418, 429):
+                        wait = min(2 ** (attempt + 1), 60)
+                        log.warning(
+                            "[%s] snapshot fetch got %d; backing off %ds",
+                            self.symbol, response.status_code, wait,
+                        )
+                        await asyncio.sleep(wait)
+                        continue
+                    response.raise_for_status()
+                    return response.json()
+                response.raise_for_status()
+                return response.json()  # unreachable but keeps mypy happy
 
     def _handle_event(self, event: dict[str, Any]) -> None:
         u = int(event["u"])
